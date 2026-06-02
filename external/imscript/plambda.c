@@ -241,10 +241,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+//#include <tgmath.h>
 
 
-//#define __STDC_IEC_559_COMPLEX__ 1
-#ifdef __STDC_IEC_559_COMPLEX__
+#ifndef __STDC_NO_COMPLEX__
 #include <complex.h>
 #endif
 
@@ -256,12 +256,17 @@
 #include "parsenumbers.c"
 #include "colorcoordsf.c"
 
+//#define PLAMBDA_WITH_GSL
+#ifdef PLAMBDA_WITH_GSL
+#include <gsl/gsl_sf.h>
+#endif
+
 
 // #defines {{{1
 
-#define PLAMBDA_MAX_TOKENS 213
+#define PLAMBDA_MAX_TOKENS 513
 #define PLAMBDA_MAX_VARLEN 0x100
-#define PLAMBDA_MAX_PIXELDIM 108
+#define PLAMBDA_MAX_PIXELDIM 600
 #define PLAMBDA_MAX_MAGIC 42
 
 
@@ -303,7 +308,9 @@
 #define IMAGEOP_HESS 1001
 #define IMAGEOP_GRAD 1002
 #define IMAGEOP_DIV 1003
-#define IMAGEOP_SHADOW 1004
+#define IMAGEOP_CURL 1004
+#define IMAGEOP_SHADOW 1005
+#define IMAGEOP_SHADOWL 1006
 #define IMAGEOP_M_ERO 2000 //E
 #define IMAGEOP_M_DIL 2001 //D
 #define IMAGEOP_M_OPE 2002 //O
@@ -317,6 +324,8 @@
 #define IMAGEOP_M_TOP 2010 //T
 #define IMAGEOP_M_BOT 2011 //B
 #define IMAGEOP_M_OSC 2012 //Z
+#define IMAGEOP_M_SUM 2013 //S
+#define IMAGEOP_M_AVG 2014 //V
 
 #define SCHEME_FORWARD 0
 #define SCHEME_BACKWARD 1
@@ -326,16 +335,17 @@
 #define SCHEME_SOBEL 5
 #define SCHEME_PREWITT 6
 #define SCHEME_SCHARR 7
-#define SCHEME_MORPHO5_FORWARD 8
-#define SCHEME_MORPHO5_BACKWARD 9
-#define SCHEME_MORPHO5_CENTERED 10
-#define SCHEME_MORPHO9_FORWARD 11
-#define SCHEME_MORPHO9_BACKWARD 12
-#define SCHEME_MORPHO9_CENTERED 13
-#define SCHEME_CROSS 14
-#define SCHEME_NCROSS 15
-#define SCHEME_SQUARE 16
-#define SCHEME_NSQUARE 17
+#define SCHEME_ROBERTS 8
+#define SCHEME_MORPHO5_FORWARD 9
+#define SCHEME_MORPHO5_BACKWARD 10
+#define SCHEME_MORPHO5_CENTERED 11
+#define SCHEME_MORPHO9_FORWARD 12
+#define SCHEME_MORPHO9_BACKWARD 13
+#define SCHEME_MORPHO9_CENTERED 14
+#define SCHEME_CROSS 15
+#define SCHEME_NCROSS 16
+#define SCHEME_SQUARE 17
+#define SCHEME_NSQUARE 18
 
 
 // local functions {{{1
@@ -356,6 +366,11 @@ static double logic_xor (double a, double b) { return !a != !b; }
 static double logic_and (double a, double b) { return a && b; }
 static double logic_not (double a) { return !a; }
 
+static double bitwise_not(double a) { return !lrint(a); }
+static double bitwise_or(double a, double b) { return lrint(a)|lrint(b); }
+static double bitwise_and(double a, double b) { return lrint(a)&lrint(b); }
+static double bitwise_xor(double a, double b) { return lrint(a)^lrint(b); }
+
 static double function_isfinite  (double x) { return isfinite(x); }
 static double function_isinf     (double x) { return isinf(x);    }
 static double function_isnan     (double x) { return isnan(x);    }
@@ -367,6 +382,8 @@ static double nantozero (double x) { return isnan(x) ? 0 : x; }
 static double notfintozero (double x) { return isfinite(x) ? x : 0; }
 static double force_finite (double x) { return isfinite(x) ? x : 0; }
 static double force_normal (double x) { return isnormal(x) ? x : 0; }
+
+static double spow(double a, double b) { return a>0 ? pow(a,b) : -pow(-a,b); }
 
 static double quantize_255 (double x)
 {
@@ -422,6 +439,56 @@ static void from_polar_to_cartesian(float *y, float *x)
 	y[1] = x[0] * sin(x[1]);
 }
 
+SMART_PARAMETER(ELLIPTICAL_C,0.6)
+
+// X[3] = { r, t }   // c^2 = a^2 - b^2
+// Y[2] = { x, y }
+static void from_elliptic_to_cartesian(float *Y, float *X)
+{
+	double r = X[0];
+	double t = X[1];
+	double c = ELLIPTICAL_C();
+	double x = c * cosh(r) * cos(t);
+	double y = c * sinh(r) * sin(t);
+	Y[0] = x;
+	Y[1] = y;
+}
+
+// X[3] = { x, y }   // c^2 = a^2 - b^2
+// Y[2] = { r, t }
+static void from_cartesian_to_elliptic(float *Y, float *X)
+{
+	double x = X[0];
+	double y = X[1];
+	double c = ELLIPTICAL_C();
+	double B = x*x + y*y - c*c;
+	double p = (-B + sqrt(B*B+4*c*c*y*y))/(2*c*c);
+	double q = (-B - sqrt(B*B+4*c*c*y*y))/(2*c*c);
+	double t = asin(sqrt(p));
+	if (x <  0 && y >= 0) t = M_PI - t;
+	if (x <= 0 && y <  0) t = M_PI + t;
+	if (x >  0 && y <  0) t = 2*M_PI - t;
+	double r = 0.5 * log(1 - 2*q + 2 * sqrt(q*q - q));
+	Y[0] = r;
+	Y[1] = t;
+}
+
+// same computation, but without conditionals (they are inside atan2).
+static void from_cartesian_to_elliptic2(float *Y, float *X)
+{
+	double x = X[0];
+	double y = X[1];
+	double c = ELLIPTICAL_C();
+	double b = x*x + y*y + c*c;
+	double k2 = (b + sqrt(b*b - 4*c*c*x*x))/(2*c*c);
+	double k = sqrt(k2);
+	double e = k + sqrt(k2 - 1);
+	double r = log(e);
+	double t = atan2((e*e+1)*y, (e*e-1)*x); // atan2(y, tanh(r)*x)
+	Y[0] = r;
+	Y[1] = t;
+}
+
 static void complex_product(float *xy, float *x, float *y)
 {
 	xy[0] = x[0]*y[0] - x[1]*y[1];
@@ -443,7 +510,7 @@ static double psubst(double x, double y, double z)
 
 static void complex_exp(float *y, float *x)
 {
-#ifdef __STDC_IEC_559_COMPLEX__
+#ifndef __STDC_NO_COMPLEX__
 	*(complex float *)y = cexp(*(complex float *)x);
 #else
 	assert(false); // this is a wrong implementation!
@@ -452,14 +519,14 @@ static void complex_exp(float *y, float *x)
 #endif
 }
 
-#ifdef __STDC_IEC_559_COMPLEX__
+#ifndef __STDC_NO_COMPLEX__
 static void complex_cpow(float *z, float *x, float *y)
 {
 	*(complex float *)z = cpow(*(complex float *)y, *(complex float *)x);
 }
 #endif
 
-#ifdef __STDC_IEC_559_COMPLEX__
+#ifndef __STDC_NO_COMPLEX__
 #define REGISTERC(f) static void complex_ ## f(float *y, float *x) {\
 	*(complex float *)y = f(*(complex float *)x); }
 REGISTERC(cacos)
@@ -480,6 +547,88 @@ REGISTERC(csqrt)
 REGISTERC(ctan)
 REGISTERC(ctanh)
 #endif
+
+//static double bessel_jn(double n, double x) { return jn(n, x); }
+//static double bessel_yn(double n, double x) { return yn(n, x); }
+
+#ifdef PLAMBDA_WITH_GSL
+static double bessel_Jn(double n, double x)
+{
+	if (!(n>=0) || !isfinite(n) || !isfinite(x)) return NAN;
+	int N = n;
+	if (N == 0) return gsl_sf_bessel_J0(x);
+	if (N == 1) return gsl_sf_bessel_J1(x);
+	return gsl_sf_bessel_Jn(N, x);
+}
+static double bessel_zero_Jn(double n, double s)
+{
+	if (!(n>=0) || !isfinite(n)) return NAN;
+	if (!(s>=0) || !isfinite(s)) return NAN;
+	int N = n;
+	int S = s;
+	if (N == 0) return gsl_sf_bessel_zero_J0(S);
+	if (N == 1) return gsl_sf_bessel_zero_J1(S);
+	return gsl_sf_bessel_zero_Jnu(N, S);
+}
+static double disk_dirichlet(double r, double t, double n, double k, double i)
+{
+	double a = bessel_zero_Jn(n, k);
+	double j = bessel_Jn(n, a * r);
+	double s = 0;
+	if (i == 1) s = cos(n * t);
+	if (i == 2) s = sin(n * t);
+	return j * s;
+}
+
+static double mathieu_a(double n, double q) { return gsl_sf_mathieu_a(n, q); }
+static double mathieu_b(double n, double q) { return gsl_sf_mathieu_b(n, q); }
+static double mathieu_ce(double n, double q, double z)
+{
+	if (!isfinite(n) || !isfinite(q) || !isfinite(z)) return NAN;
+	//	fprintf(stderr, "mathieu_ce n=%g q=%g z=%g\n", n, q, z);
+	return gsl_sf_mathieu_ce(n, q, z);
+}
+static double mathieu_se(double n, double q, double z)
+{
+	if (!isfinite(n) || !isfinite(q) || !isfinite(z)) return NAN;
+	//fprintf(stderr, "mathieu_se n=%g q=%g z=%g\n", n, q, z);
+	return gsl_sf_mathieu_se(n, q, z);
+}
+static double mathieu_Mc1(double n, double q, double z)
+{
+	if (!isfinite(n) || !isfinite(q) || !isfinite(z)) return NAN;
+	if (q <= 0) return NAN;
+	return gsl_sf_mathieu_Mc(1, n, q, z);
+}
+static double mathieu_Mc2(double n, double q, double z)
+{
+	if (!isfinite(n) || !isfinite(q) || !isfinite(z)) return NAN;
+	if (q <= 0) return NAN;
+	return gsl_sf_mathieu_Mc(2, n, q, z);
+}
+static double mathieu_Ms1(double n, double q, double z)
+{
+	if (!isfinite(n) || !isfinite(q) || !isfinite(z)) return NAN;
+	if (q <= 0) return NAN;
+	return gsl_sf_mathieu_Ms(1, n, q, z);
+}
+static double mathieu_Ms2(double n, double q, double z)
+{
+	if (!isfinite(n) || !isfinite(q) || !isfinite(z)) return NAN;
+	if (q <= 0) return NAN;
+	return gsl_sf_mathieu_Ms(2, n, q, z);
+}
+static double ellipse_dirichlet(double r, double t,
+						double n, double k, double i)
+{
+	double u = NAN;
+	double R = 1; // TODO: get it from somewhere else
+	if (i == 1) {
+		double q = mathieu_a(n, k);
+	}
+	return u;
+}
+#endif//PLAMBDA_WITH_GSL
 
 
 static void matrix_product_clean(
@@ -526,6 +675,10 @@ static int matrix_product(float *ab, float *a, float *b, int na, int nb)
 		ab[0] = a[0]*b[0] + a[1]*b[1] + a[2];
 		ab[1] = a[3]*b[0] + a[4]*b[1] + a[5];
 		return 2;
+	} else if (na == 3 && nb == 2) {
+		ab[0] = a[0] * b[0] + a[1] * b[1];
+		ab[1] = a[1] * b[0] + a[2] * b[1];
+		return 2;
 	} else fail("bad matrix product (%d %d)", na, nb);
 	assert(a_ncols == b_nrows);
 
@@ -557,15 +710,121 @@ static int scalar_product(float *ab, float *a, float *b, int na, int nb)
 	return 1;
 }
 
+// instance of "bivector_function"
+static int vector_cosine(float *ab, float *a, float *b, int na, int nb)
+{
+	float x[3];
+	scalar_product(x+0, a, b, na, nb);
+	scalar_product(x+1, a, a, na, na);
+	scalar_product(x+2, b, b, nb, nb);
+	*ab = x[0] / sqrt(x[1]*x[2]);
+	return 1;
+}
+
+// instance of "univector function"
+static int homography_build(float *r, float *a, int n)
+{
+	// 0 1 2
+	// 3 4 5
+	// 6 7 8
+	r[0] = r[4] = r[8] = 1;
+	r[1] = r[2] = r[3] = r[5] = r[6] = r[7] = 0;
+	switch(n) {
+	case 1: // rotation of angle a[0] in degrees
+		r[0] = r[4] = cos(M_PI*a[0]/180);
+		r[1] = -sin(M_PI*a[0]/180);
+		r[3] = -r[1];
+		break;
+	case 2: // translation (a[0], a[1])
+		r[2] = a[0];
+		r[5] = a[1];
+		break;
+	}
+	return 9;
+}
+
+// instance of "univector function"
+static int homography_from_cr(float *r, float *a, int n)
+{
+	if (n != 3) fail("hom-cr expects (cx,cy,angle)");
+	float p = -a[0];
+	float q = -a[1];
+	float c = cos(M_PI*a[2]/180);
+	float s = sin(M_PI*a[2]/180);
+	r[0] = c;  r[1] = -s;  r[2] = p*c - s*q - p;
+	r[3] = s;  r[4] =  c;  r[5] = p*s + c*q - q;
+	r[6] = 0;  r[7] =  0;  r[8] = 1;
+	return 9;
+}
+
+// instance of "univector function"
+static int mhtrans(float *r, float *a, int n)
+{
+	if (n != 2) fail("mhtrans expects (tx,ty)");
+	r[0] = 1; r[1] = 0; r[2] = a[0];
+	r[3] = 0; r[4] = 1; r[5] = a[1];
+	r[6] = 0; r[7] = 0; r[8] = 1;
+	return 9;
+}
+
+static int mhrot(float *r, float *a, int n)
+{
+	if (n != 1) fail("mhrot expects θ");
+	float s = sin(M_PI * a[0] / 180);
+	float c = cos(M_PI * a[0] / 180);
+	r[0] = c; r[1] = -s; r[2] = 0;
+	r[3] = s; r[4] = c; r[5] = 0;
+	r[6] = 0; r[7] = 0; r[8] = 1;
+	return 9;
+}
+
+static int mhscale(float *r, float *a, int n)
+{
+	if (n != 1) fail("mhscale expects λ");
+	float l = 1/a[0];
+	r[0] = l; r[1] = 0; r[2] = 0;
+	r[3] = 0; r[4] = l; r[5] = 0;
+	r[6] = 0; r[7] = 0; r[8] = 1;
+	return 9;
+}
+
+static int mhtilt(float *r, float *a, int n)
+{
+	if (n != 2) fail("mhtilt expects (τ,θ)");
+	float t = 1/a[0];
+	float s = sin(M_PI * a[1] / 180);
+	float c = cos(M_PI * a[1] / 180);
+	r[0] = t*c*c + s*s; r[1] = (1 - t)*c*s; r[2] = 0;
+	r[3] = (1 - t)*c*s; r[4] = t*s*s + c*c; r[5] = 0;
+	r[6] = 0          ; r[7] = 0          ; r[8] = 1;
+	return 9;
+}
+
+
 // instance of "univector_function"
 static int matrix_determinant(float *r, float *a, int n)
 {
 	switch(n) {
 	case 1: *r = *a; break;
+	case 3: *r = a[0]*a[1] - a[1]*a[2]; break;
 	case 4: *r = a[0]*a[3] - a[1]*a[2]; break;
 	case 6: *r = a[0]*a[4] - a[1]*a[3]; break;
 	case 9: *r = a[0]*a[4]*a[8] + a[2]*a[3]*a[7] + a[1]*a[5]*a[6]
 		   - a[2]*a[4]*a[6] - a[1]*a[3]*a[8] - a[0]*a[5]*a[7]; break;
+	default: fail("can not compute determinant of object of size %d", n);
+	}
+	return 1;
+}
+
+// instance of "univector_function"
+static int matrix_trace(float *r, float *a, int n)
+{
+	switch(n) {
+	case 1: *r = *a; break;
+	case 3: *r = a[0] + a[2]; break;
+	case 4: *r = a[0] + a[3]; break;
+	case 6: *r = a[0] + a[4]; break;
+	case 9: *r = a[0] + a[4] + a[8]; break;
 	default: fail("can not compute determinant of object of size %d", n);
 	}
 	return 1;
@@ -609,21 +868,28 @@ static int matrix_inverse(float *r, float *a, int n)
 	}
 }
 
-// instance of "univector_function"
-static int matrix_trace(float *r, float *a, int nn)
+// instance of "bivector_function"
+static int matrix_conjugation(float *abia, float *a, float *b, int na, int nb)
 {
-	int n;
-	switch(nn) {
-	case 1: n = 1; break;
-	case 4: n = 2; break;
-	case 9: n = 3; break;
-	default: fail("can not compute trace of object of size %d", nn);
-	}
-	assert(n*n == nn);
-	*r = 0;
-	for (int i = 0; i < n; i++)
-		*r += a[i*n+i];
-	return 1;
+	if (na != 9 || nb != 9)
+		fail("matrix conjugation only implemented for 3x3");
+
+	// compute a * b * a^-1
+	float ia[9], ab[9];
+	matrix_inverse(ia, a, 9);
+	matrix_product_clean(ab  , &na, &nb, a , 3, 3, b , 3, 3);
+	matrix_product_clean(abia, &na, &nb, ab, 3, 3, ia, 3, 3);
+	assert(na == 3 && nb == 3);
+	return 9;
+}
+
+// instance of "univector_function"
+static int vector_r90(float *r, float *a, int nn)
+{
+	if (nn != 2) fail("cannot rotate object of size %d", nn);
+	r[0] = -a[1];
+	r[1] = a[0];
+	return 2;
 }
 
 // instance of "univector_function"
@@ -866,6 +1132,10 @@ static struct predefined_function {
 	REGISTER_FUNCTIONN(logic_or,"or",2),
 	REGISTER_FUNCTIONN(logic_xor,"xor",2),
 	REGISTER_FUNCTIONN(logic_not,"not",1),
+	REGISTER_FUNCTIONN(bitwise_not,"bitnot",1),
+	REGISTER_FUNCTIONN(bitwise_or,"bitor",2),
+	REGISTER_FUNCTIONN(bitwise_xor,"bitxor",2),
+	REGISTER_FUNCTIONN(bitwise_and,"bitand",2),
 	REGISTER_FUNCTIONN(function_isfinite,"isfinite",1),
 	REGISTER_FUNCTIONN(function_isinf,"isinf",1),
 	REGISTER_FUNCTIONN(function_isnan,"isnan",1),
@@ -874,6 +1144,7 @@ static struct predefined_function {
 	REGISTER_FUNCTIONN(divide_two_doubles,"/",2),
 	REGISTER_FUNCTIONN(multiply_two_doubles,"*",2),
 	REGISTER_FUNCTIONN(substract_two_doubles,"-",2),
+	REGISTER_FUNCTIONN(spow,"spow",2),
 	REGISTER_FUNCTIONN(random_uniform,"randu",-1),
 	REGISTER_FUNCTIONN(random_normal,"randn",-1),
 	REGISTER_FUNCTIONN(random_normal,"randg",-1),
@@ -885,8 +1156,10 @@ static struct predefined_function {
 	REGISTER_FUNCTIONN(random_stable,"rands",2),
 	REGISTER_FUNCTIONN(from_cartesian_to_polar,"topolar", -2),
 	REGISTER_FUNCTIONN(from_polar_to_cartesian,"frompolar", -2),
+	REGISTER_FUNCTIONN(from_cartesian_to_elliptic2,"toell", -2),
+	REGISTER_FUNCTIONN(from_elliptic_to_cartesian,"fromell", -2),
 	REGISTER_FUNCTIONN(complex_exp,"cexp", -2),
-#ifdef __STDC_IEC_559_COMPLEX__
+#ifndef __STDC_NO_COMPLEX__
 	REGISTER_FUNCTIONN(complex_cacos , "cacos", -2),
 	REGISTER_FUNCTIONN(complex_cacosh, "cacosh", -2),
 	REGISTER_FUNCTIONN(complex_casin , "casin", -2),
@@ -906,19 +1179,51 @@ static struct predefined_function {
 	REGISTER_FUNCTIONN(complex_ctanh , "ctanh", -2),
 	REGISTER_FUNCTIONN(complex_cpow  , "cpow", -3),
 #endif
-	REGISTER_FUNCTIONN(complex_exp   , "cexp", -2),
 	REGISTER_FUNCTIONN(complex_creal , "creal", -6),
 	REGISTER_FUNCTIONN(complex_cimag , "cimag", -6),
 	REGISTER_FUNCTIONN(complex_product,"cprod", -3),
 	REGISTER_FUNCTIONN(complex_division,"cdiv", -3),
+// Note: we use GSL for bessel functions because math.h lacks the bessel roots
+//	REGISTER_FUNCTIONN(j0  , "bessel-j0", 1),
+//	REGISTER_FUNCTIONN(j1  , "bessel-j1", 1),
+//	REGISTER_FUNCTIONN(bessel_jn  , "bessel-jn", 2),
+//	REGISTER_FUNCTIONN(y0  , "bessel-y0", 1),
+//	REGISTER_FUNCTIONN(y1  , "bessel-y1", 1),
+//	REGISTER_FUNCTIONN(bessel_yn  , "bessel-yn", 2),
+#ifdef PLAMBDA_WITH_GSL
+	REGISTER_FUNCTIONN(mathieu_a  , "mathieu-a",  2),
+	REGISTER_FUNCTIONN(mathieu_b  , "mathieu-b",  2),
+	REGISTER_FUNCTIONN(mathieu_ce , "mathieu-ce", 3),
+	REGISTER_FUNCTIONN(mathieu_se , "mathieu-se", 3),
+	REGISTER_FUNCTIONN(mathieu_Mc1, "mathieu-Mc1",3),
+	REGISTER_FUNCTIONN(mathieu_Mc2, "mathieu-Mc2",3),
+	REGISTER_FUNCTIONN(mathieu_Ms1, "mathieu-Ms1",3),
+	REGISTER_FUNCTIONN(mathieu_Ms2, "mathieu-Ms2",3),
+//	REGISTER_FUNCTIONN(bessel_zero_J0, "bessel-zJ0", 1),
+//	REGISTER_FUNCTIONN(bessel_zero_J1, "bessel-zJ1", 1),
+	REGISTER_FUNCTIONN(bessel_zero_Jn, "bessel-zJn", 2),
+	REGISTER_FUNCTIONN(bessel_Jn, "bessel-Jn", 2),
+	REGISTER_FUNCTIONN(disk_dirichlet, "disk-dirichlet", 5),
+#endif
 	REGISTER_FUNCTIONN(matrix_product,"mprod",-5),
+	REGISTER_FUNCTIONN(matrix_conjugation,"mconj",-5),
 	REGISTER_FUNCTIONN(vector_product,"vprod",-5),
 	REGISTER_FUNCTIONN(scalar_product,"sprod",-5),
+	REGISTER_FUNCTIONN(vector_cosine,"vcos",-5),
+	REGISTER_FUNCTIONN(homography_build,"hbuild",-6),
+	REGISTER_FUNCTIONN(homography_from_cr,"hom-cr",-6),
+//	REGISTER_FUNCTIONN(homography_from_crs,"hdo_crs",-6),
+//	REGISTER_FUNCTIONN(homography_from_crst,"hdo_crst",-6),
+	REGISTER_FUNCTIONN(mhtrans,"mhtrans",-6),
+	REGISTER_FUNCTIONN(mhrot,"mhrot",-6),
+	REGISTER_FUNCTIONN(mhtilt,"mhtilt",-6),
+	REGISTER_FUNCTIONN(mhscale,"mhscale",-6),
 	REGISTER_FUNCTIONN(matrix_determinant,"mdet",-6),
 	REGISTER_FUNCTIONN(matrix_transpose,"mtrans",-6),
 	REGISTER_FUNCTIONN(matrix_inverse,"minv",-6),
 	REGISTER_FUNCTIONN(matrix_trace,"mtrace",-6),
 	REGISTER_FUNCTIONN(matrix_3x3to12x9,"mto12x9",-6),
+	REGISTER_FUNCTIONN(vector_r90,"r90",-6),
 	REGISTER_FUNCTIONN(vector_avg,"vavg",-6),
 	REGISTER_FUNCTIONN(vector_sum,"vsum",-6),
 	REGISTER_FUNCTIONN(vector_min,"vmin",-6),
@@ -963,6 +1268,10 @@ static float apply_function(struct predefined_function *f, float *v)
 	case 1: return ((double(*)(double))(f->f))(v[0]);
 	case 2: return ((double(*)(double,double))f->f)(v[1], v[0]);
 	case 3: return ((double(*)(double,double,double))f->f)(v[2],v[1],v[0]);
+	case 4: return ((double(*)(double,double,double,double))f->f)
+		(v[3],v[2],v[1],v[0]);
+	case 5: return ((double(*)(double,double,double,double,double))f->f)
+		(v[4],v[3],v[2],v[1],v[0]);
 	case -1: return ((double(*)(void))(f->f))();
 	default: fail("bizarre{%d}", f->nargs);
 	}
@@ -1037,6 +1346,7 @@ struct plambda_program {
 	struct plambda_token t[PLAMBDA_MAX_TOKENS];
 	struct collection_of_varnames var[1];
 
+	float colonvar_factor;
 };
 
 
@@ -1236,7 +1546,7 @@ static void compute_ordered_sample_stats(struct image_stats *s,
 {
 	if (s->init_ordered) return;
 	if (w*h > 1) s->init_ordered = true;
-	int ns = w * h * pd;
+	long ns = w * (long)h * pd;
 	s->sorted_samples = xmalloc(ns*sizeof(float));
 	FORI(ns) s->sorted_samples[i] = x[i];
 	qsort(s->sorted_samples, ns, sizeof(float), compare_floats);
@@ -1248,7 +1558,7 @@ static void compute_ordered_component_stats(struct image_stats *s,
 {
 	if (s->init_cordered) return;
 	if (w*h > 1) s->init_cordered = true;
-	int ns = w * h;
+	long ns = w * (long)h;
 	float *t = xmalloc(pd*ns*sizeof(float));
 	for (int l = 0; l < pd; l++)
 	{
@@ -1468,6 +1778,8 @@ static int token_is_vardef(const char *t)
 #define PLAMBDA_STACKOP_HALVE 13
 #define PLAMBDA_STACKOP_NSPLIT 14
 #define PLAMBDA_STACKOP_NSTACK 15
+#define PLAMBDA_STACKOP_ROT3 16
+#define PLAMBDA_STACKOP_ROX3 17
 
 // if token is a stack operation, return its id
 // otherwise, return zero
@@ -1476,12 +1788,15 @@ static int token_is_stackop(const char *t)
 	if (0 == strcmp(t, "del")) return PLAMBDA_STACKOP_DEL;
 	if (0 == strcmp(t, "dup")) return PLAMBDA_STACKOP_DUP;
 	if (0 == strcmp(t, "rot")) return PLAMBDA_STACKOP_ROT;
+	if (0 == strcmp(t, "rot3")) return PLAMBDA_STACKOP_ROT3;
+	if (0 == strcmp(t, "rox3")) return PLAMBDA_STACKOP_ROX3;
 	if (0 == strcmp(t, "split")) return PLAMBDA_STACKOP_VSPLIT;
 	if (0 == strcmp(t, "merge")) return PLAMBDA_STACKOP_VMERGE;
 	if (0 == strcmp(t, "join")) return PLAMBDA_STACKOP_VMERGE;
 	if (0 == strcmp(t, "merge3")) return PLAMBDA_STACKOP_VMERGE3;
 	if (0 == strcmp(t, "join3")) return PLAMBDA_STACKOP_VMERGE3;
 	if (0 == strcmp(t, "rgb")) return PLAMBDA_STACKOP_VMERGE3;
+	if (0 == strcmp(t, "vec")) return PLAMBDA_STACKOP_VMERGE3;
 	if (0 == strcmp(t, "mergeall")) return PLAMBDA_STACKOP_VMERGEALL;
 	if (0 == strcmp(t, "joinall")) return PLAMBDA_STACKOP_VMERGEALL;
 	if (0 == strcmp(t, "ajoin")) return PLAMBDA_STACKOP_VMERGEALL;
@@ -1595,6 +1910,7 @@ static bool hassuffix(const char *s, const char *suf)
 
 static void parse_imageop(const char *s, int *op, int *scheme)
 {
+	//fprintf(stderr, "parse_imageop \"%s\"\n", s);
 	*op = IMAGEOP_IDENTITY;
 	if (false) ;
 	else if (hasprefix(s, "xx")) *op = IMAGEOP_XX;
@@ -1607,7 +1923,10 @@ static void parse_imageop(const char *s, int *op, int *scheme)
 	else if (hasprefix(s, "n")) *op = IMAGEOP_NGRAD;
 	else if (hasprefix(s, "g")) *op = IMAGEOP_GRAD;
 	else if (hasprefix(s, "d")) *op = IMAGEOP_DIV;
+	else if (hasprefix(s, "r")) *op = IMAGEOP_CURL;
+	else if (hasprefix(s, "H")) *op = IMAGEOP_HESS;
 	else if (hasprefix(s, "S")) *op = IMAGEOP_SHADOW;
+	else if (hasprefix(s, "Z")) *op = IMAGEOP_SHADOWL;
 	else if (hasprefix(s, "E")) *op = IMAGEOP_M_ERO;
 	else if (hasprefix(s, "D")) *op = IMAGEOP_M_DIL;
 //	else if (hasprefix(s, "O")) *op = IMAGEOP_M_OPE;
@@ -1618,6 +1937,8 @@ static void parse_imageop(const char *s, int *op, int *scheme)
 	else if (hasprefix(s, "G")) *op = IMAGEOP_M_GRA;
 	else if (hasprefix(s, "I")) *op = IMAGEOP_M_IGR;
 	else if (hasprefix(s, "Y")) *op = IMAGEOP_M_EGR;
+	else if (hasprefix(s, "V")) *op = IMAGEOP_M_AVG;
+//	else if (hasprefix(s, "S")) *op = IMAGEOP_M_SUM;
 //	else if (hasprefix(s, "T")) *op = IMAGEOP_M_TOP;
 //	else if (hasprefix(s, "B")) *op = IMAGEOP_M_BOT;
 //	else if (hasprefix(s, "Z")) *op = IMAGEOP_M_OSC;
@@ -1632,6 +1953,7 @@ static void parse_imageop(const char *s, int *op, int *scheme)
 	else if (hassuffix(s, "c")) *scheme = SCHEME_CENTERED;
 	else if (hassuffix(s, "s")) *scheme = SCHEME_SOBEL;
 	else if (hassuffix(s, "p")) *scheme = SCHEME_PREWITT;
+	else if (hassuffix(s, "r")) *scheme = SCHEME_ROBERTS;
 	else if (hassuffix(s, "5")) *scheme = SCHEME_CROSS;
 	else if (hassuffix(s, "4")) *scheme = SCHEME_NCROSS;
 	else if (hassuffix(s, "9")) *scheme = SCHEME_SQUARE;
@@ -1798,6 +2120,7 @@ static void plambda_compile_program(struct plambda_program *p, const char *str)
 {
 	char s[1+strlen(str)], *spacing = " \n\t_";
 	snprintf(s, 1+strlen(str), "%s", str);
+	//fprintf(stderr, "STR \"%s\"\n", s);
 
 	collection_of_varnames_init(p->var);
 	p->n = 0;
@@ -1810,6 +2133,7 @@ static void plambda_compile_program(struct plambda_program *p, const char *str)
 
 	collection_of_varnames_sort(p->var);
 	update_variable_indices(p);
+	p->colonvar_factor = 1;
 }
 
 static const char *arity(struct predefined_function *f)
@@ -2098,7 +2422,7 @@ static void vstack_process_op(struct value_vstack *s, int opid)
 				     }
 		break;
 	case PLAMBDA_STACKOP_NSTACK:
-		vstack_push_scalar(s, s->n - 1);
+		vstack_push_scalar(s, s->n);
 		break;
 	case PLAMBDA_STACKOP_VMERGE: {
 		float x[PLAMBDA_MAX_PIXELDIM];
@@ -2133,6 +2457,30 @@ static void vstack_process_op(struct value_vstack *s, int opid)
 		int m = vstack_pop_vector(y, s);
 		vstack_push_vector(s, x, n);
 		vstack_push_vector(s, y, m);
+		break;
+				  }
+	case PLAMBDA_STACKOP_ROT3: {
+		float x[PLAMBDA_MAX_PIXELDIM];
+		float y[PLAMBDA_MAX_PIXELDIM];
+		float z[PLAMBDA_MAX_PIXELDIM];
+		int nx = vstack_pop_vector(x, s);
+		int ny = vstack_pop_vector(y, s);
+		int nz = vstack_pop_vector(z, s);
+		vstack_push_vector(s, x, nx);
+		vstack_push_vector(s, y, ny);
+		vstack_push_vector(s, z, nz);
+		break;
+				   }
+	case PLAMBDA_STACKOP_ROX3: {
+		float x[PLAMBDA_MAX_PIXELDIM];
+		float y[PLAMBDA_MAX_PIXELDIM];
+		float z[PLAMBDA_MAX_PIXELDIM];
+		int nx = vstack_pop_vector(x, s);
+		int ny = vstack_pop_vector(y, s);
+		int nz = vstack_pop_vector(z, s);
+		vstack_push_vector(s, y, ny);
+		vstack_push_vector(s, x, nx);
+		vstack_push_vector(s, z, nz);
 		break;
 				  }
 	case PLAMBDA_STACKOP_VMERGEALL:
@@ -2244,6 +2592,7 @@ static float getsample_cfg(float *x, int w, int h, int pd, int i, int j, int l)
 #define H 0.5
 #define Q 0.25
 #define O 0.125
+#define R 0.707
 static float stencil_3x3_identity[9] =  {0,0,0,  0,1,0, 0,0,0};
 static float stencil_3x3_dx_forward[9] =  {0,0,0,  0,-1,1, 0,0,0};
 static float stencil_3x3_dx_backward[9] = {0,0,0,  -1,1,0, 0,0,0};
@@ -2255,7 +2604,10 @@ static float stencil_3x3_dy_sobel[9] = {-O,-2*O,-O,  0,0,0, O,2*O,O};
 static float stencil_3x3_dx_sobel[9] = {-O,0,O,  -2*O,0,2*O, -O,0,O};
 static float stencil_3x3_dx_prewitt[9] =  {0,0,0,  0,-H,H, 0,-H,H};
 static float stencil_3x3_dy_prewitt[9] =  {0,0,0,  0,-H,-H, 0,H,H};
+static float stencil_3x3_dx_roberts[9] =  {0,0,0,  0,R,0, 0,0,-R};
+static float stencil_3x3_dy_roberts[9] =  {0,0,0,  0,0,R, 0,-R,0};
 static float stencil_3x3_laplace[9] =  {0,1,0,  1,-4,1, 0,1,0};
+static float stencil_3x3_xlaplace[9] =  {H,0,H,  0,-2,0, H,0,H};
 static float stencil_3x3_dxx[9] =  {0,0,0,  1,-2,1, 0,0,0};
 static float stencil_3x3_dyy[9] =  {0,1,0,  0,-2,0, 0,1,0};
 static float stencil_3x3_dxy_4point[9] =  {-Q,0,Q,  0,0,0, Q,0,-Q};
@@ -2266,6 +2618,7 @@ static float stencil_3x3_m_cross[9] =   {0,1,0,  1,1,1, 0,1,0};
 static float stencil_3x3_m_ncross[9] =  {0,1,0,  1,0,1, 0,1,0};
 static float stencil_3x3_m_square[9] =  {1,1,1,  1,1,1, 1,1,1};
 static float stencil_3x3_m_nsquare[9] = {1,1,1,  1,0,1, 1,1,1};
+#undef R
 #undef H
 #undef Q
 #undef O
@@ -2273,7 +2626,11 @@ static float stencil_3x3_m_nsquare[9] = {1,1,1,  1,0,1, 1,1,1};
 static float *get_stencil_3x3(int operator, int scheme)
 {
 	switch(operator) {
-	case IMAGEOP_LAP: return stencil_3x3_laplace;
+	case IMAGEOP_LAP: { switch(scheme) {
+			case SCHEME_ROBERTS: return stencil_3x3_xlaplace;
+			default: return stencil_3x3_laplace;
+			}
+		}
 	case IMAGEOP_XX: return stencil_3x3_dxx;
 	case IMAGEOP_YY: return stencil_3x3_dyy;
 	case IMAGEOP_XY: { switch(scheme) {
@@ -2290,6 +2647,7 @@ static float *get_stencil_3x3(int operator, int scheme)
 			case SCHEME_CENTERED: return stencil_3x3_dx_centered;
 			case SCHEME_SOBEL: return stencil_3x3_dx_sobel;
 			case SCHEME_PREWITT: return stencil_3x3_dx_prewitt;
+			case SCHEME_ROBERTS: return stencil_3x3_dx_roberts;
 			default: fail("unrecognized stencil,x %d", scheme);
 			}
 		}
@@ -2299,12 +2657,13 @@ static float *get_stencil_3x3(int operator, int scheme)
 			case SCHEME_CENTERED: return stencil_3x3_dy_centered;
 			case SCHEME_SOBEL: return stencil_3x3_dy_sobel;
 			case SCHEME_PREWITT: return stencil_3x3_dy_prewitt;
+			case SCHEME_ROBERTS: return stencil_3x3_dy_roberts;
 			default: fail("unrecognized stencil,y %d", scheme);
 			}
 		}
 	case IMAGEOP_M_ERO: case IMAGEOP_M_DIL: case IMAGEOP_M_MED:
 	case IMAGEOP_M_GRA: case IMAGEOP_M_IGR: case IMAGEOP_M_EGR:
-	case IMAGEOP_M_LAP: case IMAGEOP_M_ENH:
+	case IMAGEOP_M_LAP: case IMAGEOP_M_ENH: case IMAGEOP_M_AVG:
 			{ switch(scheme) {
 			case SCHEME_CROSS: return stencil_3x3_m_cross;
 			case SCHEME_NCROSS: return stencil_3x3_m_ncross;
@@ -2348,6 +2707,8 @@ static float apply_3x3_mstencil(float *img, int w, int h, int pd,
 		qsort(v, nv, sizeof*v, compare_floats);
 		r = v[nv/2];
 		break;
+	case IMAGEOP_M_SUM: r=0; for (int i=0; i<nv; i++) r += v[i]   ; break;
+	case IMAGEOP_M_AVG: r=0; for (int i=0; i<nv; i++) r += v[i]/nv; break;
 	case IMAGEOP_M_ERO: r = e           ; break;
 	case IMAGEOP_M_DIL: r = d           ; break;
 	case IMAGEOP_M_GRA: r = d - e       ; break;
@@ -2426,6 +2787,30 @@ static int imageop_vector(float *out, float *img, int w, int h, int pd,
 			out[l] = ax + by;
 		}
 		return pd/2;
+	case IMAGEOP_CURL:
+		//if (pd!=2)fail("can not compute divergence of a %d-vector",pd);
+		//float ax = apply_3x3_stencil(img, w,h,pd, ai,aj,0, sx);
+		//float by = apply_3x3_stencil(img, w,h,pd, ai,aj,1, sy);
+		//out[0] = ax + by;
+		//return 1;
+		if (pd%2)fail("can not compute divergence of a %d-vector",pd);
+		for (int l = 0; l < pd/2; l++) {
+			float ax=apply_3x3_stencil(img,w,h,pd,ai,aj,2*l+0,sx);
+			float by=apply_3x3_stencil(img,w,h,pd,ai,aj,2*l+1,sy);
+			out[l] = ax + by;
+		}
+		return pd/2;
+	case IMAGEOP_HESS: {
+		float *sxx = get_stencil_3x3(IMAGEOP_XX, t->imageop_scheme);
+		float *sxy = get_stencil_3x3(IMAGEOP_XY, t->imageop_scheme);
+		float *syy = get_stencil_3x3(IMAGEOP_YY, t->imageop_scheme);
+		for (int l = 0; l < pd; l++) {
+			out[3*l+0] = apply_3x3_stencil(img,w,h,pd,ai,aj,l, sxx);
+			out[3*l+1] = apply_3x3_stencil(img,w,h,pd,ai,aj,l, sxy);
+			out[3*l+2] = apply_3x3_stencil(img,w,h,pd,ai,aj,l, syy);
+		}
+		return 3*pd;
+		}
 	case IMAGEOP_SHADOW: {
 		if (pd != 1) fail("can not yet compute shadow of a vector");
 		float vdx[3]={1,0,apply_3x3_stencil(img, w,h,pd, ai,aj,0, sx)};
@@ -2434,6 +2819,19 @@ static int imageop_vector(float *out, float *img, int w, int h, int pd,
 		float sun[3] = {-SHADOWX(), -SHADOWY(), SHADOWZ()}, nor[3];
 		vector_product(nor, vdx, vdy, 3, 3);
 		return scalar_product(out, nor, sun, 3, 3);
+		}
+	case IMAGEOP_SHADOWL: {
+		if (pd != 1) fail("can not yet compute shadow of a vector");
+		float vdx[3]={1,0,apply_3x3_stencil(img, w,h,pd, ai,aj,0, sx)};
+		float vdy[3]={0,1,apply_3x3_stencil(img, w,h,pd, ai,aj,0, sy)};
+		//float sun[3] = {-1, -1, 1}, nor[3];
+		float sun[3] = {-SHADOWX(), -SHADOWY(), SHADOWZ()};
+		float sur[3] = {1, vdx[2], vdy[2]};
+		float nsun = hypot(sun[0], hypot(sun[1], sun[2]));
+		float nsur = hypot(sur[0], hypot(sur[1], sur[2]));
+		sun[0]/=nsun; sun[1]/=nsun; sun[2]/=nsun;
+		sur[0]/=nsur; sur[1]/=nsur; sur[2]/=nsur;
+		return scalar_product(out, sun, sur, 3, 3);
 		}
 	default: fail("unrecognized imageop %d\n", t->imageop_operator);
 	}
@@ -2483,8 +2881,16 @@ static int run_program_vectorially_at(float *out, struct plambda_program *p,
 				vstack_push_vector(s, v, 2);
 				break;
 			}
+			/*hack*/if ('Y' == t->colonvar) {
+				float v[2] = {
+					(2.0/(imw-1))*ai - 1,
+					(2.0/(imh-1))*aj - 1
+				};
+				vstack_push_vector(s, v, 2);
+				break;
+			}
 			float x = eval_colonvar(imw, imh, ai, aj, t->colonvar);
-			vstack_push_scalar(s, x);
+			vstack_push_scalar(s, x * p->colonvar_factor);
 			break;
 				       }
 		case PLAMBDA_SCALAR: {
@@ -2605,3 +3011,495 @@ static void add_hidden_variables(char *out, int maxplen, int newvars, char *in)
 	//fprintf(stderr, "HIVA: %s\n", out);
 }
 
+SMART_PARAMETER_SILENT(SRAND,0)
+
+static void setup_random_seed_from_env_SRAND()
+{
+	float s = SRAND();
+	//xsrand(100 + s - 17*s*s);
+	xsrand(s);
+	//if (SRAND()) fprintf(stderr, "plambda SRAND=%g\n", SRAND());
+}
+
+static int main_calc(int c, char **v)
+{
+	if (c < 2) {
+		fprintf(stderr, "usage:\n\t%s v1 v2 ... \"plambda\"\n", *v);
+		//                          0 1  2        c-1
+		return EXIT_FAILURE;
+	}
+
+	struct plambda_program p[1];
+	plambda_compile_program(p, v[c-1]);
+
+	int n = c - 2, pd[n], pdmax = PLAMBDA_MAX_PIXELDIM;
+	if (n > 0 && p->var->n == 0) {
+		int maxplen = n*20 + strlen(v[c-1]) + 100;
+		char newprogram[maxplen];
+		add_hidden_variables(newprogram, maxplen, n, v[c-1]);
+		plambda_compile_program(p, newprogram);
+	}
+	if (n != p->var->n)
+		fail("the program expects %d variables but %d vectors "
+					"were given", p->var->n, n);
+
+	float *x[n];
+	FORI(n) x[i] = alloc_parse_floats(pdmax, v[i+1], pd+i);
+
+	FORI(n) if (!strstr(p->var->t[i], "hidden"))
+		fprintf(stderr, "calculator correspondence \"%s\" = \"%s\"\n",
+				p->var->t[i], v[i+1]);
+
+	setup_random_seed_from_env_SRAND();
+
+	float out[pdmax];
+	int od = run_program_vectorially_at(out, p, x, NULL, NULL, pd, 0, 0);
+
+	char *fmt = getenv("PLAMBDA_FFMT");
+	if (!fmt) fmt = "%.15lf";
+	for (int i = 0; i < od; i++)
+	{
+		if (isnan(out[i]))
+			printf("nan");
+		else
+			printf(fmt, out[i]);
+		putchar(i==(od-1)?'\n':' ');
+	}
+
+	collection_of_varnames_end(p->var);
+	FORI(n) free(x[i]);
+
+
+	return EXIT_SUCCESS;
+}
+
+// @c pointer to original argc
+// @v pointer to original argv
+// @o option name (after hyphen)
+// @d default value
+static char *pick_option(int *c, char ***v, char *o, char *d)
+{
+	int argc = *c;
+	char **argv = *v;
+	int id = d ? 1 : 0;
+	for (int i = 0; i < argc - id; i++)
+		if (argv[i][0] == '-' && 0 == strcmp(argv[i]+1, o))
+		{
+			char *r = argv[i+1] + 1 - id;
+			*c -= id + 1;
+			for (int j = i; j < argc - id; j++)
+				(*v)[j] = (*v)[j+id+1];
+			return r;
+		}
+	return d;
+}
+
+#include "iio.h"
+static int main_images(int c, char **v)
+{
+	//fprintf(stderr, "main images c = %d\n", c);
+	//for (int i = 0; i < c; i++)
+	//	fprintf(stderr, "main images argv[%d] = %s\n", i, v[i]);
+
+	if (c < 2) {
+		fprintf(stderr, "usage:\n\t%s in1 in2 ... \"plambda\"\n", *v);
+		//                          0 1   2         c-1
+		return EXIT_FAILURE;
+	}
+	bool verbose = pick_option(&c, &v, "v", NULL);
+	char *filename_out = pick_option(&c, &v, "o", "-");
+	char *boundary = pick_option(&c, &v, "b", "nearest");
+	if (*boundary) setenv("GETPIXEL", boundary, 0);
+	float cfactor = atof(pick_option(&c, &v, "f", "1"));
+
+
+	struct plambda_program p[1];
+	plambda_compile_program(p, v[c-1]);
+	p->colonvar_factor = cfactor;
+
+	int n = c - 2;
+	//fprintf(stderr, "n = %d\n", n);
+	int off = 1;
+	if (n == 0) {
+		*v = "-";
+		off = 0;
+		n = 1;
+	}
+	if (n > 0 && p->var->n == 0) {
+		//fprintf(stderr, "will add hidden variables! n=%d, vn=%d\n", n, p->var->n);
+		int maxplen = n*10 + strlen(v[c-1]) + 100;
+		char newprogram[maxplen];
+		add_hidden_variables(newprogram, maxplen, n, v[c-1]);
+		plambda_compile_program(p, newprogram);
+		p->colonvar_factor = cfactor;
+	}
+	if (n != p->var->n && !(n == 1 && p->var->n == 0))
+		fail("the program expects %d variables but %d images "
+					"were given", p->var->n, n);
+	int w[n], h[n], pd[n];
+	float *x[n];
+	FORI(n) x[i] = iio_read_image_float_vec(v[i+off], w + i, h + i, pd + i);
+	//FORI(n-1)
+	//	if (w[0] != w[i+1] || h[0] != h[i+1])// || pd[0] != pd[i+1])
+	//		fail("input images size mismatch");
+
+	if (n>1) FORI(n) if (!strstr(p->var->t[i], "hidden") && verbose)
+		fprintf(stderr, "plambda correspondence \"%s\" = \"%s\"\n",
+				p->var->t[i], v[i+1]);
+
+	setup_random_seed_from_env_SRAND();
+	if (verbose) fprintf(stderr, "SRAND=%g\n", SRAND());
+
+	////print_compiled_program(p);
+	int pdreal = eval_dim(p, x, pd);
+
+	float *out = xmalloc(*w * (long)*h * pdreal * sizeof*out);
+	int opd = run_program_vectorially(out, pdreal, p, x, w, h, pd);
+	assert(opd == pdreal);
+
+	iio_write_image_float_vec(filename_out, out, *w, *h, opd);
+
+	FORI(n) free(x[i]);
+	free(out);
+	collection_of_varnames_end(p->var);
+
+	return EXIT_SUCCESS;
+}
+
+static char *help_string_name     = "plambda";
+static char *help_string_version  = "plambda 1.0\n\nWritten by mnhrdt";
+static char *help_string_oneliner = "evaluate an expression with "
+                                                         "images as variables";
+
+#define HMAN_TOP \
+"Plambda evaluates an expression with images as variables.\n\
+\n\
+The expression is written in reverse polish notation using common\n\
+operators and functions from `math.h'.  The variables appearing on the\n\
+expression are assigned to each input image in alphabetical order.\n\
+"
+//"The resulting image is printed to standard output.  The expression\n"
+//"should be written in reverse polish notation using common operators\n"
+//"and functions from `math.h'.  The variables appearing on the\n"
+//"expression are assigned to each input image in alphabetical order.\n"
+
+#define HMAN_BOT \
+"\n\
+Usage: plambda a.png b.png c.png ... \"EXPRESSION\" > output\n\
+   or: plambda a.png b.png c.png ... \"EXPRESSION\" -o output.png\n\
+   or: plambda -c num1 num2 num3  ... \"EXPRESSION\"\n\
+\n\
+Options:\n\
+ -o file\tsave output to named file\n\
+ -f factor\tscale all colonvars by this factor\n\
+ -v\t\tverbose (print correspondence between files and variables)\n\
+ -c\t\tact as a symbolic calculator\n\
+ -h\t\tdisplay short help message\n\
+ --help\t\tdisplay longer help message\n\
+ --examples\tshow more usage examples\n\
+\n\
+Examples:\n\
+ plambda a.tiff b.tiff \"x y +\" > sum.tiff\tCompute the sum of two images.\n\
+ plambda -c \"1 atan 4 *\"\t\t\tPrint pi\n\
+ plambda -c \"355 113 /\"\t\t\t\tPrint an approximation of pi\n\
+\n\
+Report bugs to <enric.meinhardt@ens-paris-saclay.fr>.\
+"
+//" --version\tdisplay version\n
+//" --man\tdisplay manpage\n
+
+#define HMAN_LONG \
+"\n\
+EXPRESSIONS:\n\n\
+A \"plambda\" expression is a sequence of tokens.\nTokens may be constants,\n\
+variables, or operators.  Constants and variables get their value\n\
+computed and pushed to the stack.  Operators pop values from the stack,\n\
+apply a function to them, and push back the results.\n\
+\n\
+CONSTANTS: numeric constants written in scientific notation, and \"pi\"\n\
+\n\
+OPERATORS: +, -, *, ^, /, <, >, ==, and all the functions from math.h\n\
+\n\
+LOGIC OPS: if, and, or, not\n\
+\n\
+VARIABLES: anything not recognized as a constant or operator.  There\n\
+must be as many variables as input images, and they are assigned to\n\
+images in alphabetical order.  If there are no variables, the input\n\
+images are pushed to the stack.\n\
+\n\
+All operators (unary, binary and ternary) are vectorizable.  Thus, you can\n\
+add a scalar to a vector, divide two vectors of the same size, and so on.\n\
+The semantics of each operation follows the principle of least surprise.\n\
+\n\
+Some \"sugar\" is added to the language:\n\
+\n\
+Predefined variables (always preceeded by a colon):\n\
+ :i\thorizontal coordinate of the pixel\n\
+ :j\tvertical coordinate of the pixel\n\
+ :w\twidth of the image\n\
+ :h\theigth of the image\n\
+ :n\tnumber of pixels in the image\n\
+ :x\trelative horizontal coordinate of the pixel\n\
+ :y\trelative horizontal coordinate of the pixel\n\
+ :r\trelative distance to the center of the image\n\
+ :t\trelative angle from the center of the image\n\
+ :I\thorizontal coordinate of the pixel (centered)\n\
+ :J\tvertical coordinate of the pixel (centered)\n\
+ :P\thorizontal coordinate of the pixel (phased)\n\
+ :Q\tvertical coordinate of the pixel (phased)\n\
+ :R\tcentered distance to the center\n\
+ :L\tminus squared centered distance to the center\n\
+ :W\twidth of the image divided by 2*pi\n\
+ :H\theight of the image divided by 2*pi\n\
+ :X\t(:i,:j) coordinates of the pixel\n\
+ :Y\t(:x,:y) relative position of the pixel (from -1 to 1)\n\
+\n\
+Variable modifiers acting on regular variables:\n\
+ x\t\tvalue of pixel (i,j)\n\
+ x(0,0)\t\tvalue of pixel (i,j)\n\
+ x(1,0)\t\tvalue of pixel (i+1,j)\n\
+ x(0,-1)\tvalue of pixel (i,j-1)\n\
+ x[0]\t\tvalue of first component of pixel (i,j)\n\
+ x[1]\t\tvalue of second component of pixel (i,j)\n\
+ x(1,2)[3]\tvalue of fourth component of pixel (i+1,j+2)\n\
+\n\
+Comma modifiers (pre-defined local operators):\n\
+ a,x\tx-derivative of the image a\n\
+ a,y\ty-derivative\n\
+ a,xx\tsecond x-derivative\n\
+ a,yy\tsecond y-derivative\n\
+ a,xy\tcrossed second derivative\n\
+ a,l\tLaplacian\n\
+ a,g\tgradient\n\
+ a,n\tgradient norm\n\
+ a,d\tdivergence\n\
+ a,S\tshadow operator\n\
+ a,H\tHessian matrix\n\
+ a,xf\tx-derivative, forward differences\n\
+ a,xb\tx-derivative, backward differences\n\
+ a,xc\tx-derivative, centered differences\n\
+ a,xs\tx-derivative, sobel\n\
+ a,xp\tx-derivative, prewitt\n\
+ a,E\tmorphological erosion (using \"cross\" structuring element)\n\
+ a,D\tmorphological dilation\n\
+ a,M\tmedian filtering\n\
+ a,L\tmorphological Laplacian\n\
+ a,X\tmorphological enhancement\n\
+ a,I\tmorphological inner gradient\n\
+ a,Y\tmorphological outer gradient\n\
+ a,G\tmorphological centered gradient\n\
+ a,V\tneighborhood average\n\
+ a,E9\tmorphological erosion (using \"square\" structuring element)\n\
+ etc\n\
+\n\
+Stack operators (allow direct manipulation of the stack):\n\
+ del\tremove the value at the top of the stack (ATTTOS)\n\
+ dup\tduplicate the value ATTTOS\n\
+ rot\tswap the two values ATTTOS\n\
+ split\tsplit the vector ATTTOS into scalar components\n\
+ join\tjoin the components of two vectors ATTOTS\n\
+ join3\tjoin the components of three vectors ATTOTS\n\
+ njoin\tjoin the components of n vectors\n\
+ halve\tsplit an even-sized vector ATTOTS into two equal-sized parts\n\
+ nstack\tcurrent number of elements in the stack (useful with njoin)\n\
+\n\
+Magic variable modifiers (global data associated to each input image):\n\
+ x%i\tvalue of the smallest sample of image x\n\
+ x%a\tvalue of the largest sample\n\
+ x%v\taverage sample value\n\
+ x%m\tmedian sample value\n\
+ x%s\tsum of all samples\n\
+ x%I\tvalue of the smallest pixel (in euclidean norm)\n\
+ x%A\tvalue of the largest pixel\n\
+ x%V\taverage pixel value\n\
+ x%S\tsum of all pixels\n\
+ x%Y\tcomponent-wise minimum of all pixels\n\
+ x%E\tcomponent-wise maximum of all pixels\n\
+ x%qn\tnth sample percentile\n\
+ x%On\tcomponent-wise nth percentile\n\
+ x%Wn\tcomponent-wise nth millionth part\n\
+ x%0n\tcomponent-wise nth order statistic\n\
+ x%9n\tcomponent-wise nth order statistic (from the right)\n\
+\n\
+Random numbers (seeded by the SRAND environment variable):\n\
+ randu\tpush a random number with distribution Uniform(0,1)\n\
+ randn\tpush a random number with distribution Normal(0,1)\n\
+ randc\tpush a random number with distribution Cauchy(0,1)\n\
+ randl\tpush a random number with distribution Laplace(0,1)\n\
+ rande\tpush a random number with distribution Exponential(1)\n\
+ randp\tpush a random number with distribution Pareto(1)\n\
+ rand\tpush a random integer returned from rand(3)\n\
+\n\
+Vectorial operations (acting over vectors of a certain length):\n\
+ topolar\tconvert a 2-vector from cartesian to polar\n\
+ frompolar\tconvert a 2-vector from polar to cartesian\n\
+ hsv2rgb\tconvert a 3-vector from HSV to RGB\n\
+ rgb2hsv\tconvert a 3-vector from RGB to HSV\n\
+ xyz2rgb\tconvert a 3-vector from XYZ to RGB\n\
+ rgb2xyz\tconvert a 3-vector from RGB to XYZ\n\
+ cprod\t\tmultiply two 2-vectrs as complex numbers\n\
+ cexp\t\tcomplex exponential\n\
+ cpow\t\tcomplex power\n\
+ mprod\t\tmultiply two 2-vectrs as matrices (4-vector = 2x2 matrix, etc)\n\
+ vprod\t\tvector product of two 3-vectors\n\
+ sprod\t\tscalar product of two n-vectors\n\
+ mdet\t\tdeterminant of a n-matrix (a n*n-vector)\n\
+ mtrans\t\ttranspose of a matrix\n\
+ mtrace\t\ttrace of a matrix\n\
+ minv\t\tinverse of a matrix\n\
+ vavg\t\taverage value of a vector\n\
+ vsum\t\tsum of the components of a vector\n\
+ vmul\t\tproduct of the components of a vector\n\
+ vmax\t\tmax component of a vector\n\
+ vmin\t\tmin component of a vector\n\
+ vnorm\t\teuclidean norm of a vector\n\
+ vdim\t\tlength of a vector\n\
+ r90\t\trotate a 2d vector by 90 degrees (or multiply by i)\n\
+\n\
+Registers (numbered from 1 to 9):\n\
+ >7\tcopy to register 7\n\
+ <3\tcopy from register 3\n\
+\n\
+"
+
+//" interleave\tinterleave\n
+//" deinterleave\tdeinterleave\n
+//" nsplit\tnsplit\n
+//
+//" x[2]%i\tminimum value of the blue channel\n
+//" \n
+//" x%M\tmedian pixel value\n
+//
+//"Environment:\n"
+//" SRAND\tseed of the random number generator (default=1)\n"
+//" CAFMT\tformat of the number printed by the calculator (default=%.15lf)\n"
+
+#define HMAN_SHORT \
+	"See the manual page for details \
+on the syntax for expressions.\n"
+
+
+static char *help_string_long     = HMAN_TOP HMAN_LONG  HMAN_BOT;
+static char *help_string_usage    = HMAN_TOP HMAN_SHORT HMAN_BOT;
+
+
+static int print_examples(void)
+{
+	return 0 * printf(
+"PLAMBDA EXAMPLES\n"
+"\n"
+"Sum two images (to standard output):\n"
+"	plambda a.png b.png +\n"
+"\n"
+"Sum two images (to the named file):\n"
+"	plambda a.png b.png + -o aplusb.png\n"
+"\n"
+"Add a gaussian to half of lena:\n"
+"	plambda /tmp/lena.png \"2 / :r :r * -1 * 40 * exp 200 * +\"\n"
+"\n"
+"Forward differences to compute the derivative in vertical direction:\n"
+"	plambda lena.png \"x(0,1) x -\"\n"
+"\n"
+"Forward differences (shorthand of the above):\n"
+"	plambda lena.png \"x,y\"\n"
+"\n"
+"Sobel edge detector (explicit version in coordinates):\n"
+"	plambda lena.png \"x(1,0) 2 * x(1,1) x(1,-1) + + x(-1,0) 2 * x(-1,1) x(-1,-1) + + - x(0,1) 2 * x(1,1) x(-1,1) + + x(0,-1) 2 * x(1,-1) x(-1,-1) + + - hypot\"\n"
+"\n"
+"Sobel edge detector (equivalent, using vectorial operators):\n"
+"	plambda lena.png \"x,gs vnorm\"\n"
+"\n"
+"Sobel edge detector (still equivalent, using even more vectorial ops):\n"
+"	plambda lena.png x,ns\n"
+"\n"
+"Color to gray (in explicit coordinates):\n"
+"	plambda lena.png \"x[0] x[1] x[2] + + 3 /\"\n"
+"\n"
+"Color to gray (equivalent, using vector operations):\n"
+"	plambda lena.png vavg\n"
+"\n"
+"Pick the blue channel of a RGB image:\n"
+"	plambda lena.png \"x[2]\"\n"
+"\n"
+"Swap the blue an green channels of a RGB image (6 equivalent ways):\n"
+"	plambda lena.png \"x[0] x[2] x[1] rgb\"\n"
+"	plambda lena.png \"x[0] x[2] x[1] join join\"\n"
+"	plambda lena.png \"x[0] x[1] x[2] rot rgb\"\n"
+"	plambda lena.png \"x[0] x[1] x[2] rot join join\"\n"
+"	plambda lena.png \"x split rot join join\"\n"
+"	plambda lena.png \"x split rot rgb\"\n"
+"\n"
+"Merge the two components of a vector field into a single file\n"
+"	plambda x.tiff y.tiff join -o xy.tiff\n"
+"\n"
+"Set to 0 the green component of a RGB image\n"
+"	plambda lena.png \"x[0] 0 x[2] rgb\"\n"
+"\n"
+"Naive Canny filter (in all its glory, using explicit coordinates):\n"
+"	cat lena.png | blur g 2 | plambda - \"x(1,0) 2 * x(1,1) x(1,-1) + + x(-1,0) 2 * x(-1,1) x(-1,-1) + + - >1 x(0,1) 2 * x(1,1) x(-1,1) + + x(0,-1) 2 * x(1,-1) x(-1,-1) + + - >2 <1 <2 hypot <2 <1 atan2 join\" | plambda - \"x[0] 4 > >1 x[1] fabs pi 4 / > x[1] fabs pi 4 / 3 * < * >2 x[1] fabs pi 4 / < x[1] fabs pi 4 / 3 * > + >3 x[0] x[0](0,1) > x[0] x[0](0,-1) > * >4 x[0] x[0](1,0) > x[0] x[0](-1,0) > * >5 <1 <3 <5 * * <1 <2 <4 * * + x[0] *\" | qauto | display\n"
+"\n"
+"Anti-Lalpacian (solve Poisson equation):\n"
+"	cat lena.png | fft 1 | plambda \":I :I * :J :J * + / -1 *\" | fft -1 | qauto | display\n"
+"\n"
+"Wiener Filter (for real kernels):\n"
+"	P=0.01  # precision\n"
+"	plambda kernel.fft image.fft \"h[0] dup dup * $P + / y *\"\n"
+"\n"
+"Deconvolution using max frequency cut (for real kernels):\n"
+"	F=80  # frequency cut\n"
+"	plambda kernel.fft image.fft \":I :J hypot $F < y h[0] / 0 if\"\n"
+"\n"
+"Generate a U(-1,1) scalar field with gaussian grain of size WxH\n"
+"	G=7 # grain size\n"
+"	plambda zero:WxH randn|blur g $G|plambda - \"$G * pi sqrt * 2 * 2 sqrt / erf\"\n"
+"\n"
+"Generate a N(0,1) scalar field with gaussian grain\n"
+"	plambda zero:WxH randn|blur g $G|plambda - \"$G * pi sqrt * 2 *\"\n"
+"\n"
+"Generate a L(0,sigma=1) scalar field with gaussian grain\n"
+"	plambda zero:WxH \"randn randn randn randn  4 njoin $G * pi sqrt * 2 *\"|blur g $G|plambda - \"x[0] x[1] * x[2] x[3] * - 2 sqrt /\"\n"
+"\n"
+"Periodic component of an image\n"
+"	cat image|fftsym|fft|plambda \":I :I * :J :J * + *\"|ifft|crop 0 0 `imprintf \"%%w %%h\" image`|fft|plambda \":I :I * :J :J * + / 4 /\"|ifft >pcomponent\n"
+"\n"
+"Periodic component of an image (faster, using external tool)\n"
+"	cat image.png | ppsmooth > pcomponent.png\n"
+"\n"
+"Localized elliptical eigenmode\n"
+"	plambda zero:400x400 \":x :y join 6 * toell dup split rot del 1 199 rox3 mathieu-se rot split del 2 9 rox3 mathieu-Ms1 *\"\n"
+"\n"
+);
+}
+
+//static int do_man(void)
+//{
+//#ifdef __OpenBSD__
+//#define MANPIPE "|mandoc -a"
+//#else
+//#define MANPIPE "|man -l -"
+//#endif
+//	return system("help2man -N -S imscript -n \"evaluate an expression "
+//				"with images as variables\" plambda" MANPIPE);
+//}
+
+#include "help_stuff.c"
+int main_plambda(int c, char **v)
+{
+	if (c == 2) if_help_is_requested_print_it_and_exit_the_program(v[1]);
+	if (c == 2 && 0 == strcmp(v[1], "--examples"))return print_examples();
+
+	int (*f)(int, char**) = **v=='c' ?  main_calc : main_images;
+	if (f == main_images && c > 2 && 0 == strcmp(v[1], "-c")) {
+		for (int i = 1; i <= c; i++)
+			v[i] = v[i+1];
+		f = main_calc;
+		c -= 1;
+	}
+	return f(c,v);
+}
+
+#ifndef HIDE_ALL_MAINS
+int main(int c, char **v) { return main_plambda(c, v); }
+#endif
+
+// vim:set foldmethod=marker:

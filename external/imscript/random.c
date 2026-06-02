@@ -18,11 +18,14 @@
 
 static uint64_t lcg_knuth_seed = 0;
 
-static void lcg_knuth_srand(uint32_t x)
+static void lcg_knuth_srand(uint64_t x)
 {
-	lcg_knuth_seed = x;
+//	fprintf(stderr, "setting knuth srand = %lu\n", x);
+	x += 10;   // avoid the linear run x=0,1,2
+	lcg_knuth_seed = x*x;
 }
 
+// linear congruential generator from "seminumerical algorithms"
 static uint32_t lcg_knuth_rand(void)
 {
 	lcg_knuth_seed *= 6364136223846793005;
@@ -30,10 +33,35 @@ static uint32_t lcg_knuth_rand(void)
 	return lcg_knuth_seed >> 32;
 }
 
-
-static void xsrand(unsigned int seed)
+#if 0
+// hacker's delight 32-bit shuffle
+static uint32_t hdshuf(uint32_t x)
 {
-	lcg_knuth_srand(seed);
+	x = (x & 0x0000FF00) << 8 | ((x >> 8) & 0x0000FF00) | (x & 0xFF0000FF);
+	x = (x & 0x00F000F0) << 4 | ((x >> 4) & 0x00F000F0) | (x & 0xF00FF00F);
+	x = (x & 0x0C0C0C0C) << 2 | ((x >> 2) & 0x0C0C0C0C) | (x & 0xC3C3C3C3);
+	x = (x & 0x22222222) << 1 | ((x >> 1) & 0x22222222) | (x & 0x99999999);
+	return x;
+}
+#endif
+
+static void xsrand(unsigned long int iseed)
+{
+#if 0
+	// shuffle the seed a bit to avoid visible runs in the common case
+	// of consecutive seeds
+	if (0) {
+		unsigned long int oseed = 7777 * iseed;
+		iseed += hdshuf(iseed);
+	}
+	//fprintf(stderr, "shuffled seed %ld -> %ld\n", oseed, iseed);
+	//uint64_t seed = iseed;
+	//uint64_t f = 2097152 + 17; // cubic root of 2^63
+	//uint64_t g = 549755813888 + 19;
+	//lcg_knuth_srand(g*seed + f);
+#endif
+
+	lcg_knuth_srand(iseed);
 }
 
 static int xrand(void)
