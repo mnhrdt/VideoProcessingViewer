@@ -1,8 +1,4 @@
-cmake_minimum_required(VERSION 3.7...3.20)
-
-if(${CMAKE_VERSION} VERSION_LESS 3.12)
-    cmake_policy(VERSION ${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION})
-endif()
+cmake_minimum_required(VERSION 3.12...3.20)
 
 project(vpv
     LANGUAGES CXX C
@@ -570,7 +566,7 @@ if (NOT CMAKE_GENERATOR MATCHES "Visual Studio" AND NOT CMAKE_GENERATOR MATCHES 
 endif()
 
 string(STRIP "${SHORT_HASH}" SHORT_HASH)
-set(VPV_VERSION "0.8.2" CACHE STRING "version string as fallback to the git describe")
+set(VPV_VERSION "0.9.0" CACHE STRING "version string as fallback to the git describe")
 if(SHORT_HASH STREQUAL "")
    set(SHORT_HASH ${VPV_VERSION})
 endif()

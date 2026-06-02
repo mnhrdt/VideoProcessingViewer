@@ -19,7 +19,7 @@
         packages = rec {
           vpv = pkgs.stdenv.mkDerivation rec {
             pname = "vpv";
-            version = "0.8.2";
+            version = "0.9.0";
             src = ./.;
 
             cargoRoot = "src/fuzzy-finder";
@@ -31,26 +31,33 @@
               "-DUSE_GDAL=ON"
               "-DUSE_OCTAVE=ON"
               "-DVPV_VERSION=${version}"
+              "-DBUILD_TESTING=ON"
             ];
 
             nativeBuildInputs = with pkgs; [
               cmake
-              pkgconfig
+              pkg-config
               rustPlatform.cargoSetupHook
               cargo
             ];
 
-            buildInputs = with pkgs; [
-              libpng
-              libtiff
-              libjpeg
-              SDL2
-              gdal
+            buildInputs = with pkgs;
+              [
+                libpng
+                libtiff
+                libjpeg
+                SDL2
+                gdal
 
-              octave
-              # (2022-11-18) broken https://github.com/NixOS/nixpkgs/issues/186928
-              #pkgs.octavePackages.image
-            ];
+                octave
+                pkgs.octavePackages.image
+              ]
+              ++ lib.optionals stdenv.hostPlatform.isLinux [
+                libGL
+                xorg.libX11
+              ];
+
+            doCheck = true;
           };
 
           default = vpv;

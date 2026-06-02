@@ -1,6 +1,6 @@
 steps:
   build:
-    image: ubuntu:devel
+    image: ubuntu:focal
     commands:
     - export DEBIAN_FRONTEND=noninteractive
     - apt-get update
